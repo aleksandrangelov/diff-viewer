@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -6,16 +7,24 @@ import { findRepo } from './git.js'
 import { runHook } from './hook.js'
 import { addHooks, removeHooks, type Settings } from './install.js'
 
+const CHANNEL_FLAG = '--dangerously-load-development-channels server:dv'
+
 const USAGE = `dv: review your working-tree changes and send comments to Claude Code
 
 Usage:
   dv                     review uncommitted changes (vs HEAD, untracked files included)
   dv --base <ref>        review changes since the merge-base with <ref> (e.g. main)
   dv --since-review, -s  review only what changed since your last submitted review
-  dv install [--project] add the delivery hooks to ~/.claude/settings.json
-                         (or .claude/settings.local.json in this repo with --project)
+  dv install [--project] add the delivery hooks to ~/.claude/settings.json (or
+                         .claude/settings.local.json in this repo with --project) and
+                         register the dv channel server with Claude Code
   dv uninstall [--project]
   dv hook stop|prompt    hook entry points used by Claude Code (reads hook JSON on stdin)
+  dv mcp                 channel server started by Claude Code
+
+Start Claude with \`claude ${CHANNEL_FLAG}\` and a submitted review wakes the
+session you send it to. Without the flag it arrives when that session's turn ends or
+with your next prompt.
 `
 
 async function main(argv: string[]): Promise<number> {
@@ -28,6 +37,12 @@ async function main(argv: string[]): Promise<number> {
     if (!process.stdin.isTTY) for await (const chunk of process.stdin) chunks.push(chunk as Buffer)
     const output = await runHook(event, Buffer.concat(chunks).toString('utf8'))
     if (output) process.stdout.write(output)
+    return 0
+  }
+
+  if (command === 'mcp') {
+    const { runMcp } = await import('./mcp.js')
+    await runMcp()
     return 0
   }
 
@@ -48,22 +63,39 @@ async function main(argv: string[]): Promise<number> {
       existed = false
     }
 
-    const before = JSON.stringify(settings)
     const dv = `node "${fileURLToPath(import.meta.url)}"`
+    const before = JSON.stringify(settings)
     if (command === 'uninstall') removeHooks(settings)
     else addHooks(settings, dv)
-    if (JSON.stringify(settings) === before) {
-      console.log(`${path} is already up to date.`)
-      return 0
+    if (JSON.stringify(settings) === before) console.log(command === 'install' ? `${path} already has the dv hooks.` : `No dv hooks in ${path}.`)
+    else {
+      await mkdir(dirname(path), { recursive: true })
+      if (existed) await copyFile(path, `${path}.bak`)
+      await writeFile(path, `${JSON.stringify(settings, null, 2)}\n`)
+      if (command === 'uninstall') console.log(`Removed the dv hooks from ${path}.`)
+      else console.log(`Added Stop and UserPromptSubmit hooks to ${path}:\n  ${dv} hook stop|prompt`)
+      if (existed) console.log(`Previous version saved to ${path}.bak`)
     }
 
-    await mkdir(dirname(path), { recursive: true })
-    if (existed) await copyFile(path, `${path}.bak`)
-    await writeFile(path, `${JSON.stringify(settings, null, 2)}\n`)
-    if (command === 'uninstall') console.log(`Removed the dv hooks from ${path}.`)
-    else console.log(`Added Stop and UserPromptSubmit hooks to ${path}:\n  ${dv} hook stop|prompt`)
-    if (existed) console.log(`Previous version saved to ${path}.bak`)
-    if (command === 'install') console.log('Restart running Claude Code sessions for them to pick it up.')
+    const scope = rest.includes('--project') ? 'local' : 'user'
+    const claude = (...args: string[]) => spawnSync('claude', ['mcp', ...args], { encoding: 'utf8' })
+    const removed = claude('remove', '--scope', scope, 'dv')
+    if (removed.error) {
+      console.log(`Could not run \`claude\` to ${command === 'install' ? 'register' : 'remove'} the dv channel server: ${removed.error.message}`)
+      return 1
+    }
+    if (command === 'uninstall') {
+      console.log(removed.status === 0 ? `Removed the dv channel server (${scope} scope).` : 'The dv channel server was not registered.')
+      return 0
+    }
+    const added = claude('add', '--scope', scope, 'dv', '--', 'node', fileURLToPath(import.meta.url), 'mcp')
+    if (added.status !== 0) {
+      console.log(`Registering the dv channel server failed:\n${added.stderr || added.stdout}`)
+      return 1
+    }
+    console.log(`Registered the dv channel server with Claude Code (${scope} scope).`)
+    console.log(`\nStart Claude with the channel so reviews wake it, e.g. add to your shell profile:\n  alias cc='claude ${CHANNEL_FLAG}'`)
+    console.log('Restart running Claude Code sessions for them to pick it up.')
     return 0
   }
 

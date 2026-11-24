@@ -1,6 +1,6 @@
 {
   "name": "diff-viewer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Terminal diff viewer for reviewing Claude Code changes and sending comments back to the agent",
   "type": "module",
   "bin": {

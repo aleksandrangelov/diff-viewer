@@ -7,6 +7,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import stringWidth from 'string-width'
 import { parseDiff, type FileDiff } from '../diff.js'
 import { diffTrees, git, headTree, pinnedTree, pinTree, treeOf, worktreeTree, type Repo } from '../git.js'
+import { isAlive, processes, type Session } from '../session.js'
 import { newId, Store, type Comment } from '../store.js'
 import { highlightFile, type Highlights, type Segment } from './highlight.js'
 import { buildRows, commentFromSelection } from './rows.js'
@@ -106,6 +107,8 @@ function App({ repo, baseRef, sinceReview: initialSince, pollMs = 1500 }: Option
   const [pending, setPending] = useState(0)
   const [deleted, setDeleted] = useState<Comment | null>(null)
   const [highlights, setHighlights] = useState<{ file: FileDiff; map: Highlights } | null>(null)
+  const [targets, setTargets] = useState<Session[]>([])
+  const [targetIdx, setTargetIdx] = useState(0)
 
   const snapRef = useRef<Snapshot | null>(null)
   const loading = useRef(false)
@@ -199,7 +202,7 @@ function App({ repo, baseRef, sinceReview: initialSince, pollMs = 1500 }: Option
   const showList = columns >= 90
   const listWidth = showList ? Math.min(44, Math.floor(columns * 0.28)) : 0
   const diffWidth = columns - listWidth - (showList ? 1 : 0)
-  const inputHeight = input ? Math.min(6, input.text.split('\n').length) + 3 : 0
+  const inputHeight = input ? Math.min(6, input.text.split('\n').length) + (input.purpose === 'summary' ? 4 : 3) : 0
   const bodyHeight = Math.max(3, termRows - 2 - inputHeight)
   const cur = Math.max(0, Math.min(cursor, rows.length - 1))
 
@@ -225,6 +228,7 @@ function App({ repo, baseRef, sinceReview: initialSince, pollMs = 1500 }: Option
       if (key.ctrl && ch === 'w') return setInput({ ...input, text: input.text.replace(/\S*\s*$/, '') })
       if (key.backspace || key.delete) return setInput({ ...input, text: input.text.slice(0, -1) })
       if ((key.return && key.meta) || (key.ctrl && ch === 'j')) return setInput({ ...input, text: input.text + '\n' })
+      if (key.tab && input.purpose === 'summary') return setTargetIdx((i) => (targets.length ? (i + 1) % targets.length : 0))
 
       if (key.ctrl && ch === 'e') {
         void (async () => {
@@ -251,11 +255,18 @@ function App({ repo, baseRef, sinceReview: initialSince, pollMs = 1500 }: Option
           const list = comments ?? []
           if (list.length === 0 && !text) return setStatus('Nothing to submit: add a comment or a summary')
           if (!snap) return
+          const target = targets[targetIdx]
           void (async () => {
-            await store.submit({ id: newId(), createdAt: new Date().toISOString(), baseLabel: snap.label, summary: text, comments: list })
+            await store.submit({
+              id: newId(), createdAt: new Date().toISOString(), baseLabel: snap.label, summary: text, comments: list,
+              ...(target && { target: { pid: target.pid, started: target.started } }),
+            })
             setComments([])
             setPending(await store.pendingCount())
-            setStatus('Review queued. Claude gets it when its current turn ends, or with your next prompt.')
+            setStatus(!target ? 'Review queued. The next Claude session here to finish a turn or get a prompt picks it up.'
+              : target.channel && target.state !== 'busy' ? 'Review sent. Claude is picking it up now.'
+              : target.channel ? 'Review queued. Claude gets it when its current turn ends.'
+              : 'Review queued. Claude gets it when its current turn ends, or with your next prompt.')
             await pinTree(repo, snap.head)
           })().catch(fail)
           return
@@ -283,7 +294,15 @@ function App({ repo, baseRef, sinceReview: initialSince, pollMs = 1500 }: Option
         snapRef.current = null
         return
       }
-      if (ch === 'S') return setInput({ purpose: 'summary', text: '' })
+      if (ch === 'S') {
+        setInput({ purpose: 'summary', text: '' })
+        void Promise.all([store.sessions(), processes()]).then(([sessions, procs]) => {
+          for (const dead of sessions.filter((x) => !isAlive(procs, x))) void store.removeSession(dead)
+          setTargets(sessions.filter((x) => isAlive(procs, x)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)))
+          setTargetIdx(0)
+        }, fail)
+        return
+      }
       if (key.tab) return setFocus(focus === 'files' ? 'diff' : 'files')
       if (ch === 'n' || ch === ']') return selectFile(fileIdx + 1)
       if (ch === 'p' || ch === '[') return selectFile(fileIdx - 1)
@@ -432,17 +451,27 @@ function App({ repo, baseRef, sinceReview: initialSince, pollMs = 1500 }: Option
   const inputTitle = input?.purpose === 'summary'
     ? `Submit review (${commentCount} comment${commentCount === 1 ? '' : 's'}): optional overall note, enter to send`
     : input?.purpose === 'edit' ? 'Edit comment' : `Comment on ${where}`
+  const target = targets[targetIdx]
+  const targetLine = !target
+    ? 'No Claude session seen in this repo yet: the next one to finish a turn or get a prompt picks it up'
+    : [
+        `→ ${target.prompt ? `"${fitText(target.prompt.replace(/\s+/g, ' '), Math.min(48, stringWidth(target.prompt.replace(/\s+/g, ' ')))).trimEnd()}"` : `session ${target.pid}`}`,
+        target.channel ? target.state ?? 'idle' : 'no channel',
+        `${Math.max(0, Math.round((Date.now() - Date.parse(target.updatedAt)) / 60000))}m ago`,
+        ...(targets.length > 1 ? [`tab: next session (${targetIdx + 1}/${targets.length})`] : []),
+      ].join(' · ')
 
   return (
     <Box flexDirection="column" width={columns} height={termRows}>
       <Text backgroundColor={COLORS.headerBg} bold>
-        {fitText(left, Math.max(0, columns - stringWidth(right)))}
+        {fitText(left, Math.max(0, columns - stringWidth(right) - 1))}{' '}
         <Text color={COLORS.comment}>{right}</Text>
       </Text>
       <Box flexGrow={1} flexDirection="column" overflow="hidden">{body}</Box>
       {input && (
         <Box flexDirection="column" borderStyle="round" borderColor={COLORS.comment} paddingX={1}>
           <Text color={COLORS.comment}>{inputTitle}</Text>
+          {input.purpose === 'summary' && <Text color={COLORS.hunk}>{fitText(targetLine, columns - 4)}</Text>}
           {input.text.split('\n').slice(-6).map((l, i, all) => (
             <Text key={i}>{l}{i === all.length - 1 ? <Text inverse> </Text> : null}</Text>
           ))}

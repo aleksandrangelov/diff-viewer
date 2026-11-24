@@ -1,5 +1,6 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import type { Session, SessionRef } from './session.js'
 
 export interface Comment {
   id: string
@@ -18,6 +19,7 @@ export interface Review {
   baseLabel: string
   summary: string
   comments: Comment[]
+  target?: SessionRef
 }
 
 export function newId(): string {
@@ -66,9 +68,9 @@ export class Store {
     return names.filter((n) => n.endsWith('.json')).length
   }
 
-  // Moves every pending review to delivered/ and returns them. The rename is the claim: if two hooks race,
-  // only the one whose rename succeeds delivers a given review.
-  async claimPending(): Promise<Review[]> {
+  // Moves the accepted pending reviews to delivered/ and returns them. The rename is the claim: if two
+  // sessions race, only the one whose rename succeeds delivers a given review.
+  async claimPending(accept: (review: Review) => boolean = () => true): Promise<Review[]> {
     const names = (await readdir(this.path('pending')).catch(() => [] as string[]))
       .filter((n) => n.endsWith('.json'))
       .sort()
@@ -78,12 +80,44 @@ export class Store {
     for (const name of names) {
       const target = this.path('delivered', name)
       try {
+        const review = JSON.parse(await readFile(this.path('pending', name), 'utf8')) as Review
+        if (!accept(review)) continue
         await rename(this.path('pending', name), target)
-        reviews.push(JSON.parse(await readFile(target, 'utf8')) as Review)
+        reviews.push(review)
       } catch {
         continue
       }
     }
     return reviews
+  }
+
+  async unclaim(reviews: Review[]): Promise<void> {
+    for (const r of reviews) await rename(this.path('delivered', `${r.id}.json`), this.path('pending', `${r.id}.json`))
+  }
+
+  async updateSession(ref: SessionRef, patch: Partial<Session>): Promise<void> {
+    await mkdir(this.path('sessions'), { recursive: true })
+    const path = this.path('sessions', `${ref.pid}.json`)
+    let current: Partial<Session> = {}
+    try {
+      current = JSON.parse(await readFile(path, 'utf8')) as Session
+      if (current.started !== ref.started) current = {}
+    } catch {}
+    await writeAtomic(path, JSON.stringify({ ...current, ...patch, pid: ref.pid, started: ref.started, updatedAt: new Date().toISOString() }, null, 2))
+  }
+
+  async sessions(): Promise<Session[]> {
+    const names = await readdir(this.path('sessions')).catch(() => [] as string[])
+    const sessions: Session[] = []
+    for (const name of names.filter((n) => n.endsWith('.json'))) {
+      try {
+        sessions.push(JSON.parse(await readFile(this.path('sessions', name), 'utf8')) as Session)
+      } catch {}
+    }
+    return sessions
+  }
+
+  async removeSession(ref: SessionRef): Promise<void> {
+    await rm(this.path('sessions', `${ref.pid}.json`), { force: true })
   }
 }
