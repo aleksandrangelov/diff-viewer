@@ -1,0 +1,34 @@
+{
+  "name": "diff-viewer",
+  "version": "0.1.0",
+  "description": "Terminal diff viewer for reviewing Claude Code changes and sending comments back to the agent",
+  "type": "module",
+  "bin": {
+    "dv": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --splitting --outdir=dist --packages=external --jsx=automatic --banner:js='#!/usr/bin/env node' && chmod +x dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ink": "^8.0.0",
+    "react": "^19.3.1",
+    "shiki": "^4.6.0",
+    "string-width": "^8.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "esbuild": "^0.28.2",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
+  }
+}
